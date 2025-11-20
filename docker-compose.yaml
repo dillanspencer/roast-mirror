@@ -1,0 +1,10 @@
+version: "2.1"
+
+services:
+  mirror:
+    build: ./mirror
+    restart: always
+    privileged: true
+    network_mode: "host"
+    environment:
+      - PYTHONUNBUFFERED=1
