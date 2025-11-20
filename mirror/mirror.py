@@ -71,5 +71,11 @@ def hls_files(filename):
     return send_from_directory(HLS_DIR, filename)
 
 
+@app.route("/trigger_mirror", methods=['POST'])
+def trigger_mirror():
+    print("Mirror triggered!")
+    return "200"
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=3000, threaded=True)
