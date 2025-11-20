@@ -1,1 +1,4 @@
 flask
+openai
+opencv-python
+dotenv
