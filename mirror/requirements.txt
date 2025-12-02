@@ -2,3 +2,4 @@ flask
 openai
 opencv-python
 dotenv
+elevenlabs[pyaudio]
