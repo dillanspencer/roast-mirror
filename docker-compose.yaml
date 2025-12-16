@@ -1,0 +1,15 @@
+version: "2.1"
+
+services:
+  mirror:
+    build: ./mirror
+    privileged: true
+    network_mode: "host"
+    environment:
+      - PYTHONUNBUFFERED=1
+    devices:
+      - "/dev/snd"
+  mediamtx:
+    build: ./mediamtx
+    privileged: true
+    network_mode: "host"
