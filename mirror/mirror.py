@@ -5,6 +5,7 @@ from pathlib import Path
 import base64
 import random
 from queue import Queue
+import requests
 
 import cv2
 from flask import (
@@ -22,12 +23,21 @@ from elevenlabs import ElevenLabs
 
 load_dotenv()
 
+# Load the JSON file
+with open("prompts.json", "r", encoding="utf-8") as f:
+    prompts = json.load(f)
+
 HLS_DIR = Path("/app/hls")
 HLS_DIR.mkdir(exist_ok=True)
 
 # directory to store tts audio
 AUDIO_DIR = Path("/app/audio")
 AUDIO_DIR.mkdir(exist_ok=True)
+
+OLLAMA_URL = "http://10.0.0.111:11434/api/generate"
+MODEL = "huihui_ai/qwen3-vl-abliterated:8b-instruct"
+
+cycle = 0
 
 app = Flask(__name__)
 
@@ -66,27 +76,19 @@ eleven_client = ElevenLabs(
     api_key=os.environ.get("ELEVENLABS_API_KEY"),
 )
 
-# Prompt templates
-prompts = [
-    "pmpt_6922564bdf248194a09e7beca13bb4e50169736a9f3529b8",  # hood slang
-    "pmpt_69225843c1148194904d558b4c21e10b07f426335240a852",  # asian father
-    "pmpt_69225a457d7081979a8952e7bf29f181060fa0efb31aac45",  # grandfather
-    "pmpt_692f84b4dcc48196a034c3395b36f8700bd94338843c6f1e",  # jamacian auntie
-]
-
 # map prompt -> elevenlabs voice ID
 voices = {
-    "pmpt_6922564bdf248194a09e7beca13bb4e50169736a9f3529b8": "6OzrBCQf8cjERkYgzSg8",
-    "pmpt_69225843c1148194904d558b4c21e10b07f426335240a852": "7DkaWvcqvBstUe3167oW",
-    "pmpt_69225a457d7081979a8952e7bf29f181060fa0efb31aac45": "MKlLqCItoCkvdhrxgtLv",
-    "pmpt_692f84b4dcc48196a034c3395b36f8700bd94338843c6f1e": "mrDMz4sYNCz18XYFpmyV",
+    "AUNTIE": "mrDMz4sYNCz18XYFpmyV",
+    "FRIEND": "6OzrBCQf8cjERkYgzSg8",
+    "FATHER": "7DkaWvcqvBstUe3167oW",
+    "GRANDPA": "MKlLqCItoCkvdhrxgtLv",
 }
 
 
 def capture_frame_from_rtsp(stream_url="rtsp://localhost:8554/cam"):
     """
     Capture a single frame from the given RTSP stream using OpenCV
-    and return it as a JPEG data URL (data:image/jpeg;base64,...)
+    and return it as base64 JPEG string (no data: prefix).
     """
     cap = cv2.VideoCapture(stream_url)
     if not cap.isOpened():
@@ -114,8 +116,7 @@ def capture_frame_from_rtsp(stream_url="rtsp://localhost:8554/cam"):
 
     jpg_bytes = buffer.tobytes()
     b64 = base64.b64encode(jpg_bytes).decode("utf-8")
-    data_url = f"data:image/jpeg;base64,{b64}"
-    return data_url
+    return b64
 
 
 # ---------- ElevenLabs TTS helper ----------
@@ -142,8 +143,8 @@ def generate_elevenlabs_audio(text: str, voice_id: str) -> str | None:
         "speed": 0.9,
         "stability": 0.5,
         "similarity": 0.75,
-        "style_exaggeration": 1,  # <- expressive voice
-        "speaker_boost": True       # <- louder, clearer
+        "style_exaggeration": 1,   # expressive voice
+        "speaker_boost": True      # louder, clearer
     }
 
     audio_stream = eleven_client.text_to_speech.convert(
@@ -183,7 +184,7 @@ def generate_elevenlabs_audio(text: str, voice_id: str) -> str | None:
 def events():
     """
     SSE endpoint. Each connected client gets its own queue.
-    We push JSON strings with {text, audio_url} whenever /trigger_mirror runs.
+    We push JSON strings with {loading, text, audio_url}.
     """
     global CURRENT_MIRROR_TEXT, CURRENT_AUDIO_FILENAME
 
@@ -193,6 +194,7 @@ def events():
     def gen():
         # Send current state immediately
         initial_payload = json.dumps({
+            "loading": False,
             "text": CURRENT_MIRROR_TEXT,
             "audio_url": f"/audio/{CURRENT_AUDIO_FILENAME}" if CURRENT_AUDIO_FILENAME else None,
         })
@@ -210,11 +212,12 @@ def events():
     return Response(stream_with_context(gen()), mimetype="text/event-stream")
 
 
-def broadcast_update(text: str, audio_filename: str | None):
+def broadcast_update(text: str | None = None, audio_filename: str | None = None, loading: bool = False):
     """
     Push a JSON payload to all subscribers via their queues.
     """
     payload = json.dumps({
+        "loading": loading,
         "text": text,
         "audio_url": f"/audio/{audio_filename}" if audio_filename else None,
     })
@@ -232,8 +235,9 @@ def index():
     """
     Main page:
     - shows an iframe with 10.0.0.42:8889/cam
+    - shows a spinner while mirror is "thinking"
     - shows the current text
-    - listens to /events via SSE for text + audio updates
+    - listens to /events via SSE for loading + text + audio updates
     """
     html = """
     <!doctype html>
@@ -274,6 +278,18 @@ def index():
             font-size: 14px;
             color: #aaa;
           }
+
+          /* Spinner */
+          #spinner {
+            width: 56px;
+            height: 56px;
+            border: 6px solid rgba(255,255,255,0.15);
+            border-top: 6px solid rgba(255,255,255,0.9);
+            border-radius: 50%;
+            animation: spin 0.9s linear infinite;
+            display: none;
+          }
+          @keyframes spin { to { transform: rotate(360deg); } }
         </style>
       </head>
       <body>
@@ -286,6 +302,8 @@ def index():
         ></iframe>
 
         <div id="status">Connecting...</div>
+
+        <div id="spinner"></div>
         <div id="mirror-text"></div>
 
         <!-- Audio element for playing the mirror voice -->
@@ -295,6 +313,18 @@ def index():
           const statusEl = document.getElementById('status');
           const textEl = document.getElementById('mirror-text');
           const audioEl = document.getElementById('mirror-audio');
+          const spinnerEl = document.getElementById('spinner');
+
+          const setLoading = (isLoading) => {
+            spinnerEl.style.display = isLoading ? 'block' : 'none';
+            textEl.style.display = isLoading ? 'none' : 'block';
+            audioEl.style.display = isLoading ? 'none' : 'block';
+            if (isLoading) {
+              statusEl.textContent = 'Thinking...';
+            } else {
+              statusEl.textContent = 'Connected to mirror stream';
+            }
+          };
 
           const evtSource = new EventSource('/events');
 
@@ -311,6 +341,14 @@ def index():
               console.error('Failed to parse SSE payload', e, event.data);
               return;
             }
+
+            if (payload.loading === true) {
+              setLoading(true);
+              return;
+            }
+
+            // loading false (or missing) => hide spinner once we have real data
+            setLoading(false);
 
             if (payload.text !== undefined && payload.text !== null) {
               textEl.textContent = payload.text;
@@ -329,6 +367,7 @@ def index():
           evtSource.onerror = (err) => {
             console.error('SSE error', err);
             statusEl.textContent = 'Disconnected from mirror stream';
+            setLoading(false);
           };
         </script>
       </body>
@@ -350,83 +389,77 @@ def trigger_mirror():
     """
     This endpoint is meant to be called by something else (not the webpage).
     It:
+      - broadcasts loading=true (spinner on)
       - captures a frame
-      - gets OpenAI text
+      - gets Ollama text
       - generates ElevenLabs audio (mp3)
       - updates globals
-      - broadcasts {text, audio_url} to the webpage via SSE
+      - broadcasts loading=false + {text, audio_url} to the webpage via SSE
     """
     global CURRENT_MIRROR_TEXT, CURRENT_AUDIO_FILENAME
 
     print("Mirror trigger received")
 
+    # Tell clients we're working (show spinner immediately)
+    broadcast_update(text=None, audio_filename=None, loading=True)
+
     # 1) Capture a still frame from the camera
     img_data_url = capture_frame_from_rtsp()
     if img_data_url is None:
+        broadcast_update(text="Failed to capture frame.", audio_filename=None, loading=False)
         return jsonify({"error": "Failed to capture frame"}), 500
 
-    # 2) Pick a random prompt template and matching voice
-    selected_prompt = random.choice(prompts)
+    # 2) Pick a random prompt template and matching voice, cycle through them
+    global cycle
+    selected_prompt = list(prompts.keys())[cycle % len(prompts)]
+    cycle += 1
     voice_id = voices.get(selected_prompt)
     if voice_id is None:
         print(f"No ElevenLabs voice configured for prompt {selected_prompt}")
         voice_id = list(voices.values())[0]  # fallback
 
-    # 3) Ask OpenAI for a response based on the image + prompt template
+    # 3) Ask Ollama for a response based on the image + prompt template
+    payload = {
+        "model": MODEL,
+        "system": prompts[selected_prompt],
+        "prompt": "Roast the person in the image.",
+        "images": [img_data_url],
+        "stream": False,
+        "keep_alive": 0,
+    }
+
     try:
-        response = openai_client.responses.create(
-            prompt={"id": selected_prompt},
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_image", "image_url": img_data_url},
-                    ],
-                }
-            ],
-        )
-
-        print("OpenAI response object:", response)
-
-        assistant_message = None
-        for item in response.output:
-            if getattr(item, "type", None) == "message":
-                assistant_message = item
-                break
-
-        if assistant_message is None:
-            raise ValueError("No assistant message found in response.output")
-
-        text_chunks = []
-        for c in assistant_message.content:
-            if getattr(c, "type", None) == "output_text":
-                text_chunks.append(c.text)
-
-        if not text_chunks:
-            raise ValueError("No output_text content found in assistant message")
-
-        mirror_text = " ".join(text_chunks)
-
+        r = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        print("Failed to parse OpenAI response:", e)
-        return jsonify({"error": "Failed to parse OpenAI response"}), 500
+        err_text = f"LLM request failed: {e}"
+        print(err_text)
+        broadcast_update(text=err_text, audio_filename=None, loading=False)
+        return jsonify({"error": err_text}), 500
 
-    print("OpenAI response text:", mirror_text)
+    text = (data.get("response") or "").strip()
+
+    # optional hard-stop to one sentence
+    if "." in text:
+        text = text.split(".")[0].strip() + "."
+
+    print("LLM response text:", text)
 
     # 4) Generate ElevenLabs audio and get filename
-    audio_filename = generate_elevenlabs_audio(mirror_text, voice_id)
+    audio_filename = generate_elevenlabs_audio(text, voice_id)
 
     # 5) Update global state
-    CURRENT_MIRROR_TEXT = mirror_text
+    CURRENT_MIRROR_TEXT = text
     CURRENT_AUDIO_FILENAME = audio_filename
 
-    # 6) Broadcast to all connected SSE clients
-    broadcast_update(CURRENT_MIRROR_TEXT, CURRENT_AUDIO_FILENAME)
+    # 6) Broadcast final update (hide spinner + show text/audio)
+    broadcast_update(text=CURRENT_MIRROR_TEXT, audio_filename=CURRENT_AUDIO_FILENAME, loading=False)
 
     # 7) Respond to whoever called /trigger_mirror
     return jsonify({
         "status": "ok",
-        "text": mirror_text,
+        "text": text,
         "audio_file": audio_filename,
         "audio_url": f"/audio/{audio_filename}" if audio_filename else None,
     })

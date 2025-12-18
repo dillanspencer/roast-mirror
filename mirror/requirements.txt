@@ -3,3 +3,4 @@ openai
 opencv-python
 dotenv
 elevenlabs[pyaudio]
+requests
